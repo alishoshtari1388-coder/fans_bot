@@ -1,0 +1,456 @@
+
+
+import asyncio
+import logging
+import zipfile
+import re
+from io import BytesIO
+from datetime import datetime, timedelta
+from collections import Counter
+
+from telethon import TelegramClient, events, functions, types
+from telethon.tl.types import (
+    KeyboardButtonCallback,
+    UserStatusOnline,
+    UserStatusOffline,
+    MessageEntityMentionName,
+    MessageActionChatAddUser,
+    MessageActionChatDeleteUser
+)
+from telethon.tl.types import (
+    InputBotInlineResult,
+    InputBotInlineMessageText
+)
+from telethon.errors import FloodWaitError
+from gtts import gTTS
+
+logging.basicConfig(level=logging.WARNING)
+print("خدای مانیتور شخصی — نسخهٔ نهایی کامل — در حال بیدار شدن...")
+
+# ================== تنظیمات مهم ==================
+API_ID = 26330588  # جایگزین کنید
+API_HASH = "fb26ef0a6a40c89fa8b9d8cd2603b533"  # جایگزین کنید
+BOT_TOKEN = "8568412721:AAHOG5Vn3GlNofmVi4D0hYTPCAumrohxxXg"
+ALLOWED_USERS = [5410416130, 8114452804]
+ALERT_CHAT_ID = -5000071115
+ADMIN_ID = 5410416130
+MAX_RESULTS = 800
+# ================================================
+
+client = TelegramClient(
+    'ultimate_god_mode_final', 
+    API_ID, 
+    API_HASH,
+    connection_retries=5,
+    retry_delay=3,
+    timeout=60
+).start(bot_token=BOT_TOKEN)
+
+# ذخیره‌سازی پیشرفته
+live_targets = {}
+watching_alert = set()
+watching_online = set()
+saved_users = {}
+last_profile = {}
+last_online_notif = {}
+edited_cache = {}
+deleted_cache = {}
+
+async def get_user_by_input(user_input):
+    """تابع پیشرفته برای پیدا کردن کاربر با انواع مختلف ورودی"""
+    try:
+        # اگر @ دارد، مستقیماً جستجو کن
+        if user_input.startswith('@'):
+            return await client.get_entity(user_input)
+        
+        # اگر عدد است، سعی کن به عنوان آیدی استفاده کنی
+        if user_input.isdigit():
+            user_id = int(user_input)
+            
+            # روش ۱: سعی کن مستقیم با آیدی پیدا کنی
+            try:
+                return await client.get_entity(user_id)
+            except:
+                pass
+            
+            # روش ۲: در دیالوگ‌های اخیر جستجو کن
+            try:
+                async for dialog in client.iter_dialogs(limit=100):
+                    if dialog.entity.id == user_id:
+                        return dialog.entity
+            except:
+                pass
+            
+            # روش ۳: در پیام‌های اخیر جستجو کن
+            try:
+                async for message in client.iter_messages(None, limit=100):
+                    if message.sender and message.sender.id == user_id:
+                        return message.sender
+            except:
+                pass
+            
+            # اگر هیچکدام جواب نداد، خطا بده
+            raise ValueError(f"کاربر با آیدی {user_id} پیدا نشد. مطمئن شوید کاربر در گروه/کانالی است که ربات عضو است.")
+        
+        # اگر نه عدد است نه @، سعی کن به عنوان @ در نظر بگیر
+        return await client.get_entity(f"@{user_input}")
+        
+    except Exception as e:
+        raise ValueError(f"پیدا کردن کاربر ناموفق: {str(e)}")
+
+async def get_user_info(uid):
+    """تابع کمکی برای دریافت اطلاعات کاربر"""
+    try:
+        user = await client.get_entity(uid)
+        return user.username or user.first_name or str(uid)
+    except:
+        return str(uid)
+
+async def search_today(user_id):
+    msgs = []
+    try:
+        async for m in client.iter_messages(None, from_user=user_id, limit=MAX_RESULTS, wait_time=2):
+            if m.date.date() == datetime.now().date():
+                msgs.append(m)
+                deleted_cache[m.id] = m.text or "[مدیا]"
+                edited_cache[m.id] = m.text or "[مدیا]"
+    except Exception as e:
+        print(f"خطا در جستجوی امروز: {e}")
+    return msgs
+
+async def search_7days(user_id):
+    msgs = []
+    cutoff = datetime.now() - timedelta(days=7)
+    try:
+        async for m in client.iter_messages(None, from_user=user_id, limit=MAX_RESULTS*2):
+            if m.date >= cutoff:
+                msgs.append(m)
+    except:
+        pass
+    return msgs
+
+async def send_alert(user, message, alert_type="پیام جدید", extra=""):
+    try:
+        chat = message.chat
+        title = getattr(chat, 'title', 'کامنت کانال')
+        
+        if str(chat.id).startswith('-100'):
+            link = f"https://t.me/c/{str(chat.id)[4:]}/{message.id}"
+        else:
+            username = getattr(chat, 'username', '')
+            link = f"https://t.me/{username}/{message.id}" if username else "لینک در دسترس نیست"
+        
+        username_info = await get_user_info(user.id)
+        text = f"{alert_type}\n\n@{username_info}\n{title}\n{message.text or '[مدیا]'}\n{link}\n{extra}"
+        await client.send_message(ALERT_CHAT_ID, text)
+        
+        if message.media:
+            await client.send_file(ALERT_CHAT_ID, message.media, caption=f"{alert_type} از @{username_info}")
+    except Exception as e:
+        print(f"خطا در ارسال هشدار: {e}")
+
+async def daily_report_task():
+    while True:
+        now = datetime.now()
+        if now.hour == 8 and now.minute < 5:
+            for uid, data in saved_users.items():
+                await send_daily_report(uid, data['chat_id'])
+            await asyncio.sleep(300)
+        await asyncio.sleep(60)
+
+async def send_daily_report(user_id, chat_id):
+    try:
+        user = await client.get_entity(user_id)
+        msgs = await search_today(user_id)
+        if not msgs:
+            return
+        
+        first = min(msgs, key=lambda x: x.date)
+        last = max(msgs, key=lambda x: x.date)
+        all_text = " ".join([m.text or "" for m in msgs if m.text])
+        words = re.findall(r'\w+', all_text.lower())
+        top_words = Counter(words).most_common(10)
+        top_str = ", ".join([f"{w}({c})" for w, c in top_words]) if top_words else "ندارد"
+
+        text = f"گزارش روزانه @{user.username or user_id}\n\n"
+        text += f"پیام امروز: {len(msgs)}\n"
+        text += f"اولین پیام: {first.date.strftime('%H:%M')}\n"
+        text += f"آخرین پیام: {last.date.strftime('%H:%M')}\n"
+        text += f"کلمات پرتکرار: {top_str}"
+
+        try:
+            tts = gTTS(text, lang='fa')
+            buf = BytesIO()
+            tts.write_to_fp(buf)
+            buf.seek(0)
+            await client.send_file(chat_id, buf, voice_note=True, caption="گزارش صوتی خدای مانیتور")
+        except:
+            pass
+        
+        await client.send_message(chat_id, text)
+    except Exception as e:
+        print(f"خطا در گزارش روزانه: {e}")
+
+@client.on(events.NewMessage(pattern='/start'))
+async def start(event):
+    if event.sender_id not in ALLOWED_USERS:
+        await event.reply("ربات خصوصی است — دسترسی فقط برای صاحب و یک نفر دیگر")
+        return
+    
+    start_text = (
+        "🤖 خدای مانیتور شخصی فعال شد!\n\n"
+        "برای استفاده:\n"
+        "• @username کاربر را بفرستید\n"
+        "• یا آیدی عددی کاربر را بفرستید\n\n"
+        "⚠️ نکته: کاربر باید در گروه/کانال عمومی فعالیت داشته باشد\n\n"
+        "دستورات:\n"
+        "/save @user → ذخیره برای گزارش روزانه\n"
+        "/watch @user → هشدار کامل\n"
+        "/panel → پنل مدیریت"
+    )
+    await event.reply(start_text)
+
+@client.on(events.NewMessage(pattern='/save'))
+async def save_user(event):
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    try:
+        if len(event.message.text.split()) < 2:
+            error_text = (
+                "❌ لطفاً یوزرنیم یا آیدی کاربر را وارد کنید\n"
+                "مثال: /save @username یا /save 123456789"
+            )
+            await event.reply(error_text)
+            return
+            
+        user_input = event.message.text.split(maxsplit=1)[1].strip()
+        user = await get_user_by_input(user_input)
+        
+        saved_users[user.id] = {
+            'name': user.username or user.first_name or str(user.id), 
+            'chat_id': event.chat_id
+        }
+        username_info = await get_user_info(user.id)
+        await event.reply(f"✅ کاربر @{username_info} ذخیره شد\n📊 گزارش روزانه هر روز ۸ صبح ارسال می‌شود")
+        
+    except Exception as e:
+        error_text = (
+            f"❌ خطا: {str(e)}\n\n"
+            "💡 راهنمایی:\n"
+            "• از @username استفاده کنید\n"
+            "• مطمئن شوید کاربر در گروه/کانال عمومی است\n"
+            "• ربات را به گروه مورد نظر اضافه کنید"
+        )
+        await event.reply(error_text)
+
+@client.on(events.NewMessage(pattern='/watch'))
+async def watch_user(event):
+    if event.sender_id not in ALLOWED_USERS:
+        return
+    try:
+        if len(event.message.text.split()) < 2:
+            error_text = (
+                "❌ لطفاً یوزرنیم یا آیدی کاربر را وارد کنید\n"
+                "مثال: /watch @username یا /watch 123456789"
+            )
+            await event.reply(error_text)
+            return
+            
+        user_input = event.message.text.split(maxsplit=1)[1].strip()
+        user = await get_user_by_input(user_input)
+        
+        watching_alert.add(user.id)
+        watching_online.add(user.id)
+        username_info = await get_user_info(user.id)
+        await event.reply(f"👁️ هشدار کامل فعال شد برای @{username_info}")
+        
+    except Exception as e:
+        error_text = (
+            f"❌ خطا: {str(e)}\n\n"
+            "💡 راهنمایی:\n"
+            "• از @username استفاده کنید\n"
+            "• مطمئن شوید کاربر در گروه/کانال عمومی است"
+        )
+        await event.reply(error_text)
+
+@client.on(events.NewMessage)
+async def normal_search(event):
+    if event.sender_id not in ALLOWED_USERS or not event.is_private or event.message.text.startswith('/'):
+        return
+    
+    user_input = event.message.text.strip()
+    try:
+        user = await get_user_by_input(user_input)
+    except Exception as e:
+        await event.reply(f"❌ {str(e)}")
+        return
+
+    msg = await event.reply("🔍 در حال جستجوی فعالیت‌های کاربر...")
+    
+    try:
+        today_msgs = await search_today(user.id)
+        week_msgs = await search_7days(user.id)
+
+        if not today_msgs:
+            await msg.edit(f"📭 کاربر @{user.username or user.id} امروز هیچ فعالیتی در گروه‌های عمومی نداشته")
+            return
+
+        first = min(today_msgs, key=lambda x: x.date)
+        last = max(today_msgs, key=lambda x: x.date)
+
+        # چارت ساعتی
+        hours = {i: 0 for i in range(24)}
+        for m in today_msgs:
+            hours[m.date.hour] += 1
+        max_h = max(hours.values()) or 1
+        hour_chart = "📊 فعالیت ساعتی:\n"
+        for h in range(24):
+            if hours[h] > 0:
+                bar = "█" * int(hours[h] * 10 / max_h)
+                hour_chart += f"{h:02d}:00 {bar} {hours[h]}\n"
+
+        text = f"📋 گزارش @{user.username or user.id}\n\n"
+        text += f"📅 امروز: {len(today_msgs)} پیام\n"
+        text += f"⏰ اولین: {first.date.strftime('%H:%M')}\n"
+        text += f"⏰ آخرین: {last.date.strftime('%H:%M')}\n"
+        text += f"📆 ۷ روز گذشته: {len(week_msgs)} پیام\n\n"
+        text += hour_chart
+
+        buttons = [
+            [KeyboardButtonCallback("📦 دانلود مدیاها", data=f"zip_{user.id}".encode())],
+            [KeyboardButtonCallback("👥 مشاهده گروه‌ها", data=f"chats_{user.id}".encode())]
+        ]
+        await msg.edit(text, buttons=buttons)
+        
+    except Exception as e:
+        await msg.edit(f"❌ خطا در جستجو: {str(e)}")
+
+@client.on(events.CallbackQuery(pattern=lambda data: data.startswith(b"zip_")))
+async def zip_handler(event):
+    uid = int(event.data.split(b"_")[1])
+    await event.answer("📦 در حال جمع‌آوری مدیاها...", alert=True)
+    
+    try:
+        msgs = await search_today(uid)
+        media_msgs = [m for m in msgs if m.media]
+        
+        if not media_msgs:
+            return await event.answer("❌ مدیایی برای دانلود پیدا نشد")
+        
+        await event.reply(f"🔍 {len(media_msgs)} مدیا پیدا شد. در حال آماده‌سازی...")
+        
+        # محدود کردن برای جلوگیری از overload
+        media_msgs = media_msgs[:15]
+        
+        zip_buffer = BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, m in enumerate(media_msgs):
+                try:
+                    file_data = await client.download_media(m.media, bytes)
+                    if file_data:
+                        if m.photo:
+                            ext = ".jpg"
+                        elif m.video:
+                            ext = ".mp4"
+                        elif m.audio:
+                            ext = ".mp3"
+                        else:
+                            ext = ".dat"
+                        
+                        zf.writestr(f"media_{i+1}{ext}", file_data)
+                except Exception as e:
+                    print(f"خطا در دریافت مدیا: {e}")
+        
+        zip_buffer.seek(0)
+        username_info = await get_user_info(uid)
+        
+        await client.send_file(
+            event.sender_id, 
+            zip_buffer, 
+            filename=f"مدیاهای_{username_info}_{datetime.now().strftime('%Y%m%d')}.zip",
+            caption=f"📦 مدیاهای امروز کاربر @{username_info}"
+        )
+        await event.answer("✅ فایل ZIP ارسال شد!")
+        
+    except Exception as e:
+        await event.answer(f"❌ خطا: {str(e)}")
+
+@client.on(events.CallbackQuery(pattern=lambda data: data.startswith(b"chats_")))
+async def show_chats(event):
+    uid = int(event.data.split(b"_")[1])
+    msgs = await search_today(uid)
+    chats = {}
+    for m in msgs:
+        chat = m.chat
+        if not chat:
+            continue
+        cid = chat.id
+        title = getattr(chat, 'title', 'کامنت کانال')
+        prefix = "💬 کامنت" if getattr(chat, 'broadcast', False) and m.is_reply else "👥 گروه"
+        key = f"{prefix}_{cid}"
+        if key not in chats:
+            chats[key] = {'title': title, 'msgs': [], 'prefix': prefix}
+        chats[key]['msgs'].append(m)
+
+    text = f"📍 مکان‌های فعال امروز ({len(chats)})\n\n"
+    buttons = []
+    for key, data in list(chats.items())[:10]:
+        count = len(data['msgs'])
+        btn_text = f"{data['prefix']}: {data['title'][:25]} ({count})"
+        cid = key.split("_", 1)[1]
+        buttons.append([KeyboardButtonCallback(btn_text, data=f"show_{uid}_{cid}".encode())])
+    
+    buttons.append([KeyboardButtonCallback("🔙 بازگشت", data=b"back_main")])
+    await event.edit(text, buttons=buttons)
+
+@client.on(events.NewMessage(pattern='/panel'))
+async def panel(event):
+    if event.sender_id != ADMIN_ID:
+        await event.reply("❌ فقط ادمین اصلی دسترسی دارد")
+        return
+    
+    text = f"🎛 پنل مدیریت خدای مانیتور\n\n"
+    text += f"📡 فوروارد لایو: {len(live_targets)}\n"
+    text += f"👁️ هشدار کامل: {len(watching_alert)}\n"
+    text += f"📊 گزارش روزانه: {len(saved_users)}\n\n"
+    
+    buttons = [[KeyboardButtonCallback("🛑 توقف همه", data=b"stop_all")]]
+    await event.reply(text, buttons=buttons)
+
+@client.on(events.CallbackQuery(pattern=b"stop_all"))
+async def stop_all_handler(event):
+    if event.sender_id != ADMIN_ID:
+        await event.answer("❌ دسترسی denied", alert=True)
+        return
+    
+    live_targets.clear()
+    watching_alert.clear()
+    watching_online.clear()
+    saved_users.clear()
+    last_profile.clear()
+    await event.edit("✅ همه چیز متوقف و پاک شد")
+
+@client.on(events.CallbackQuery(pattern=b"back_main"))
+async def back_main_handler(event):
+    await event.edit("🔙 به منوی اصلی بازگشتید")
+
+@client.on(events.CallbackQuery(pattern=b"back_chats"))
+async def back_chats_handler(event):
+    await event.edit("🔙 به لیست چت‌ها بازگشتید")
+
+async def main():
+    try:
+        print("✅ خدای مانیتور شخصی فعال شد!")
+        print("🤖 ربات آماده دریافت دستورات است...")
+        await client.run_until_disconnected()
+    except Exception as e:
+        print(f"خطای اصلی: {e}")
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        print("ربات متوقف شد")
+    finally:
+        loop.close()
